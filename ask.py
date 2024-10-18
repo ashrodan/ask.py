@@ -7,9 +7,8 @@ from typing import Any, Dict, List, Optional
 import click
 import requests
 from bs4 import BeautifulSoup
-from jinja2 import BaseLoader, Environment
-from openai import OpenAI
-
+from langchain.chat_models import ChatOpenAI
+from langchain.schema import HumanMessage, SystemMessage
 
 def get_logger(log_level: str) -> logging.Logger:
     logger = logging.getLogger(__name__)
@@ -48,7 +47,7 @@ class Ask:
         if self.llm_api_key is None:
             err_msg += "LLM_API_KEY env variable not set.\n"
 
-        if err_msg != "":
+        if err_msg:
             raise Exception(f"\n{err_msg}\n")
 
         self.llm_base_url = os.environ.get("LLM_BASE_URL")
@@ -61,7 +60,7 @@ class Ask:
             f"https://www.googleapis.com/customsearch/v1?key={self.search_api_key}"
             f"&cx={self.search_project_id}&q={escaped_query}"
         )
-        url_paras = f"&safe=active"
+        url_paras = "&safe=active"
         if date_restrict is not None and date_restrict > 0:
             url_paras += f"&dateRestrict={date_restrict}"
         if target_site is not None and target_site != "":
@@ -157,25 +156,26 @@ class Ask:
         results = self.memory.search(query, top_n=10)
         return results
 
-    def _get_api_client(self) -> OpenAI:
-        return OpenAI(api_key=self.llm_api_key, base_url=self.llm_base_url)
-
-    def _render_template(self, template_str: str, variables: Dict[str, Any]) -> str:
-        env = Environment(loader=BaseLoader(), autoescape=False)
-        template = env.from_string(template_str)
-        return template.render(variables)
+    def _get_chat_model(self, model_name: str) -> ChatOpenAI:
+        return ChatOpenAI(
+            model_name=model_name,
+            openai_api_key=self.llm_api_key,
+            openai_api_base=self.llm_base_url,
+            temperature=0
+        )
 
     def run_inference(
         self, query: str, model_name: str, matched_chunks: List[Dict[str, Any]]
     ) -> str:
-        system_prompt = (
-            "You are expert summarizing the answers based on the provided contents."
+        system_prompt = SystemMessage(
+            content="You are expert summarizing the answers based on the provided contents."
         )
-        user_promt_template = """
+
+        user_prompt_template = """
 Given the context as a sequence of references with a reference id in the 
 format of a leading [x], please answer the following question:
 
-{{ query }}
+{query}
 
 In the answer, use format [1], [2], ..., [n] in line where the reference is used. 
 For example, "According to the research from Google[3], ...".
@@ -184,38 +184,26 @@ Please create the answer strictly related to the context. If the context has no
 information about the query, please write "No related information found in the context."
 
 Here is the context:
-{{ context }}
+{context}
 """
         context = ""
         for i, chunk in enumerate(matched_chunks):
             context += f"[{i+1}] {chunk['chunk']}\n"
 
-        user_prompt = self._render_template(
-            user_promt_template, {"query": query, "context": context}
+        human_message = HumanMessage(
+            content=user_prompt_template.format(query=query, context=context)
         )
 
         self.logger.debug(f"Running inference with model: {model_name}")
-        self.logger.debug(f"Final user prompt: {user_prompt}")
+        self.logger.debug(f"Final user prompt: {human_message.content}")
 
-        api_client = self._get_api_client()
-        completion = api_client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
-            ],
-        )
-        if completion is None:
+        chat = self._get_chat_model(model_name)
+        response = chat([system_prompt, human_message])
+
+        if response is None:
             raise Exception("No completion from the API")
 
-        response_str = completion.choices[0].message.content
-        return response_str
+        return response.content
 
 
 @click.command(help="Search web for the query and summarize the results")
@@ -284,9 +272,9 @@ def search_extract_summarize(
 
     logger.info("✅ Running inference with context ...")
     answer = ask.run_inference(query, model_name, results)
-    logger.info("✅ Finished inference, generateing output ...")
-    click.echo(f"# Answer\n\n{answer}\n")
-    click.echo(f"# References\n")
+    logger.info("✅ Finished inference, generating output ...")
+    click.echo("# Answer\n\n{}\n".format(answer))
+    click.echo("# References")
     for i, result in enumerate(results):
         click.echo(f"[{i+1}] {result['metadata']['url']}")
 
